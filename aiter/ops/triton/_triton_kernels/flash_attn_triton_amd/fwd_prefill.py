@@ -885,7 +885,7 @@ def attn_fwd(
     # compute offsets
     off_h_q = tl.program_id(0)
     # apply the xcd remapping for the hq dim
-    off_h_q = remap_xcd(off_h_q, NUM_XCD)
+    off_h_q = remap_xcd(off_h_q, HQ, NUM_XCD)
 
     start_m = tl.program_id(1)
     off_z = tl.program_id(2)
