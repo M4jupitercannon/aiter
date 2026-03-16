@@ -327,15 +327,7 @@ def _get_compiled_stage2(
     _n_in = model_dim
     _k_in = inter_dim
 
-    reduce_exe = None
-    if not accumulate:
-        from .kernels.moe_gemm_2stage import compile_moe_reduction
-
-        reduce_exe = compile_moe_reduction(
-            topk=topk,
-            model_dim=model_dim,
-            dtype_str=out_dtype,
-        )
+    _topk = topk
 
     def tensor_api(
         out: torch.Tensor,
@@ -362,12 +354,17 @@ def _get_compiled_stage2(
         if is_fp4:
             empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
             stream = torch.cuda.current_stream().cuda_stream
+            # fp4/e8m0 dtypes are not supported by dlpack; cast to uint8
+            _a = a.view(torch.uint8) if a.dtype not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32) else a
+            _w = w.view(torch.uint8) if w.dtype not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32) else w
+            _as = a_scale.view(torch.uint8) if a_scale is not None and a_scale.numel() > 0 and a_scale.dtype not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32) else a_scale
+            _ws = w_scale.view(torch.uint8) if w_scale is not None and w_scale.numel() > 0 and w_scale.dtype not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32) else w_scale
             exe(
                 target,
-                a,
-                w,
-                a_scale,
-                w_scale,
+                _a,
+                _w,
+                _as,
+                _ws,
                 sorted_ids,
                 sorted_expert_ids,
                 topk_weights,
@@ -397,13 +394,7 @@ def _get_compiled_stage2(
             )
 
         if not accumulate:
-            stream = torch.cuda.current_stream().cuda_stream
-            reduce_exe(
-                target.view(token_num, topk, model_dim),
-                out,
-                token_num,
-                stream,
-            )
+            torch.sum(target.view(token_num, _topk, model_dim), dim=1, out=out)
 
     return tensor_api
 
