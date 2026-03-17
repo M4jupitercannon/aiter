@@ -1727,6 +1727,8 @@ def attention_forward_prefill_triton_impl(
     arch = get_arch()
     force_masking = arch.is_rdna
 
+    num_xcd = 1 if arch.is_rdna else 8
+
     # launch kernel
     def grid(META):
         return (nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]), batch)
@@ -1806,5 +1808,5 @@ def attention_forward_prefill_triton_impl(
         FP8_P_DESCALE=False,
         USE_SEQUSED=(seqused_q is not None or seqused_k is not None),
         FORCE_MASKING=force_masking,
-        NUM_XCD=8,
+        NUM_XCD=num_xcd,
     )

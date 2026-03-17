@@ -4338,6 +4338,9 @@ def attention_backward_triton_impl(
     if mode == "fused":
         seqlen = max(max_seqlen_q, max_seqlen_k)
 
+        arch = get_arch()
+        num_xcd = 1 if arch.is_rdna else 8
+
         def grid(META):
             return (
                 nheads_k,
@@ -4434,7 +4437,7 @@ def attention_backward_triton_impl(
                 ),  # Add flag for seqused
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
-                NUM_XCD=8,
+                NUM_XCD=num_xcd,
             )
         else:
             bwd_kernel_fused_noncausal[grid](
@@ -4522,7 +4525,7 @@ def attention_backward_triton_impl(
                 ),  # Add flag for seqused
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
-                NUM_XCD=8,
+                NUM_XCD=num_xcd,
             )
     elif mode == "fused_atomic":
         NUM_WARPS, NUM_STAGES = 4, 1
