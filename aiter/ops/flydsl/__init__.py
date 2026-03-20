@@ -14,12 +14,14 @@ __all__ = [
 ]
 
 if is_flydsl_available():
+    from .mla_fwd_decode import flydsl_mla_fwd_decode
     from .moe_kernels import (
         flydsl_moe_stage1,
         flydsl_moe_stage2,
     )
 
     __all__ += [
+        "flydsl_mla_fwd_decode",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
     ]
