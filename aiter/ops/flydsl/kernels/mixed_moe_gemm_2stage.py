@@ -218,7 +218,7 @@ def compile_mixed_moe_gemm1(
     _async_tag = "_async" if use_async_copy else ""
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}_v27"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}_v30"
     ).replace("-", "_")
 
     # -- LDS sizing (split ping/pong allocators) --
@@ -260,6 +260,61 @@ def compile_mixed_moe_gemm1(
         _shuffle_dists_s1.append(_sh_val)
         _sh_val *= 2
     _num_shuffle_steps_s1 = len(_shuffle_dists_s1)
+
+    # Pre-compute interleaved pipeline schedule (outside @flyc.kernel
+    # to avoid AST rewriter intercepting plain Python loops/ifs).
+    _pipe_m_repeat = tile_m // 16
+    _pipe_k_unroll = tile_k_bytes // 128
+    _pipe_k_unroll_packed = _pipe_k_unroll // pack_K
+    _pipe_m_repeat_packed = _pipe_m_repeat // pack_M
+    _pipe_num_acc_n = (tile_n // 4) // 16
+
+    _pipe_a_groups = []
+    for _mi in range(_pipe_m_repeat):
+        _grp = []
+        for _k in range(_pipe_k_unroll):
+            _grp.append((_k, _mi))
+            if len(_grp) == 2:
+                _pipe_a_groups.append(_grp)
+                _grp = []
+        if _grp:
+            _pipe_a_groups.append(_grp)
+
+    _pipe_b_loads = []
+    for ku in range(_pipe_k_unroll):
+        for ni in range(_pipe_num_acc_n):
+            _pipe_b_loads.append(('gate', ku, ni))
+            _pipe_b_loads.append(('up', ku, ni))
+
+    _pipe_mfma_order = []
+    for _ku128 in range(_pipe_k_unroll_packed):
+        for _mi in range(_pipe_m_repeat_packed):
+            for _ikxdl in range(pack_K):
+                for _imxdl in range(pack_M):
+                    _k_idx = _ku128 * pack_K + _ikxdl
+                    _mi_idx = _mi * pack_M + _imxdl
+                    _asv_idx = _ku128 * _pipe_m_repeat_packed + _mi
+                    _pipe_mfma_order.append(
+                        (_k_idx, _mi_idx, _ikxdl, _imxdl, _asv_idx)
+                    )
+
+    _pipe_total_phases = len(_pipe_mfma_order)
+    _pipe_n_a_phases = len(_pipe_a_groups)
+
+    _pipe_b_sched = [[] for _ in range(_pipe_total_phases)]
+    _bi = 0
+    for _p in range(1, _pipe_n_a_phases):
+        for _ in range(min(2, len(_pipe_b_loads) - _bi)):
+            _pipe_b_sched[_p].append(_pipe_b_loads[_bi])
+            _bi += 1
+    for _p in range(_pipe_n_a_phases, _pipe_total_phases):
+        _rem_b = len(_pipe_b_loads) - _bi
+        _rem_p = _pipe_total_phases - _p
+        _n_b = (_rem_b + _rem_p - 1) // _rem_p if _rem_p > 0 else 0
+        for _ in range(_n_b):
+            if _bi < len(_pipe_b_loads):
+                _pipe_b_sched[_p].append(_pipe_b_loads[_bi])
+                _bi += 1
 
     if True:
 
@@ -1039,11 +1094,14 @@ def compile_mixed_moe_gemm1(
                     a_reg, gate_bp, up_bp,
                     a_scale_val, gate_bs_val, up_bs_val,
                     gate_list, up_list,
-                    ikxdl, imxdl,
+                    ikxdl, imxdl, mi_idx=None,
                 ):
                     """Compute 4 MFMAs for one A tile (gate + up for each N group).
 
                     gate_bp/up_bp: (packs0, packs1) where packs0[ni] is gb0 for that N group.
+                    ikxdl/imxdl: inner pack indices for MFMA block selector (0..pack_K-1, 0..pack_M-1).
+                    mi_idx: full M-repeat index for accumulator addressing (0..m_repeat-1).
+                            Defaults to imxdl when m_repeat_packed == 1.
                     """
                     c0_i64 = arith.constant(0, type=T.i64)
                     vec4_i64 = T.vec(4, T.i64)
@@ -1054,7 +1112,8 @@ def compile_mixed_moe_gemm1(
                         return vector.bitcast(vec8_i32, v4)
 
                     mfma_res_ty = vec4_f32
-                    mi_idx = imxdl
+                    if mi_idx is None:
+                        mi_idx = imxdl
                     if is_f8_a:
                         a128 = _pack(a_reg[0], a_reg[1], a_reg[2], a_reg[3])
                     else:
@@ -1108,24 +1167,22 @@ def compile_mixed_moe_gemm1(
                 ):
                     """One flatmm-style interleaved half-iteration (deep pipeline).
 
+                    Generalized for arbitrary m_repeat (block_m=32, 64, ...).
                     DMA targets lds_write (OTHER buffer) while ds_read uses
-                    lds_read (already DMA'd in previous half).  This eliminates
-                    the stall between DMA issue and ds_read: only ONE barrier
-                    per half-boundary instead of two.
+                    lds_read (already DMA'd in previous half).
 
-                      Phase i: 1 ds_read(lds_read) + 2 B loads + 1 scale → 4 MFMAs
+                    Interleaving schedule (per half):
+                      Phase 0: scale VMEM + 2 ds_read(A) → 4 MFMA(prev)
+                      Phase 1..N: B VMEM(distributed) + 2 ds_read(A, if avail) → 4 MFMA(prev)
+                      Phase N+1..: remaining B VMEM → 4 MFMA(prev)
                     """
                     _bk = next_k_load // 2
                     _sk = next_k_load // pack_K // 128
                     _k_off = _sk * layout_b_scale.stride_k0
 
-                    # Wait for PREVIOUS DMA (to lds_read) + all outstanding
-                    # ops, then sync threads.  Separate s_waitcnt + raw
-                    # s_barrier (inline-asm bypasses SIInsertWaitcnts).
                     rocdl.sched_barrier(0)
                     rocdl.s_waitcnt(2)
                     _barrier()
-                    # _barrier(vmcnt=2, lgkmcnt=0)
                     rocdl.sched_barrier(0)
 
                     # DMA A to OTHER buffer (for next half), non-blocking
@@ -1134,132 +1191,116 @@ def compile_mixed_moe_gemm1(
                     if not use_async_copy:
                         _x_regs = load_x_tile(next_k_dma_py)
 
-                    # Extract previous scale values
-                    _asv = vector.extract(
-                        prev_a_scale[0], static_position=[0], dynamic_position=[]
+                    # ---- Extract previous scale values ----
+                    _prev_asvs = []
+                    for _mi_p in range_constexpr(m_repeat_packed):
+                        _prev_asvs.append(vector.extract(
+                            prev_a_scale[_mi_p],
+                            static_position=[0], dynamic_position=[],
+                        ))
+                    _prev_gsv = vector.extract(
+                        prev_gate_bs[0], static_position=[0], dynamic_position=[],
                     )
-                    _gsv = vector.extract(
-                        prev_gate_bs[0], static_position=[0], dynamic_position=[]
-                    )
-                    _usv = vector.extract(
-                        prev_up_bs[0], static_position=[0], dynamic_position=[]
+                    _prev_usv = vector.extract(
+                        prev_up_bs[0], static_position=[0], dynamic_position=[],
                     )
 
-                    # Phase 0: ds_read A[0] + B(ku=0,ni=0) + scale_a
-                    _as_v = buffer_ops.buffer_load(
-                        sx_rsrc, _a_scale_bases[0] + _k_off,
-                        vec_width=1, dtype=T.i32, cache_modifier=0,
-                    )
-                    _gs_v = buffer_ops.buffer_load(
-                        sw_rsrc, _gate_scale_bases[0] + _k_off,
-                        vec_width=1, dtype=T.i32, cache_modifier=0,
-                    )
-                    _us_v = buffer_ops.buffer_load(
-                        sw_rsrc, _up_scale_bases[0] + _k_off,
-                        vec_width=1, dtype=T.i32, cache_modifier=0,
-                    )
-                    # _barrier()
+                    # ---- Execute phases with proper interleaving ----
+                    # Schedules pre-computed outside @flyc.kernel:
+                    #   _pipe_a_groups, _pipe_b_sched, _pipe_mfma_order
+                    _a_all = {}
+                    _b_gate_all = {}
+                    _b_up_all = {}
 
-                    rocdl.sched_barrier(0)
-                    _a0 = load_a_subtile(0, 0, lds_read)
-                    _a1 = load_a_subtile(0, 1, lds_read)
-                    rocdl.sched_barrier(0)
+                    for _p in range_constexpr(_pipe_total_phases):
+                        # Phase 0: scale VMEM loads
+                        if _p == 0:
+                            _new_as_list = []
+                            for _mi_p in range_constexpr(m_repeat_packed):
+                                _new_as_list.append(buffer_ops.buffer_load(
+                                    sx_rsrc, _a_scale_bases[_mi_p] + _k_off,
+                                    vec_width=1, dtype=T.i32, cache_modifier=0,
+                                ))
+                            _new_gs = buffer_ops.buffer_load(
+                                sw_rsrc, _gate_scale_bases[0] + _k_off,
+                                vec_width=1, dtype=T.i32, cache_modifier=0,
+                            )
+                            _new_us = buffer_ops.buffer_load(
+                                sw_rsrc, _up_scale_bases[0] + _k_off,
+                                vec_width=1, dtype=T.i32, cache_modifier=0,
+                            )
 
-                    rocdl.s_setprio(1)
-                    compute_4mfma_phase(
-                        prev_a_tile[0], prev_gate_w[0], prev_up_w[0],
-                        _asv, _gsv, _usv,
-                        acc_gate, acc_up, 0, 0,
-                    )
-                    rocdl.s_setprio(0)
-                    # _barrier()
-                    rocdl.sched_barrier(0)
+                        # B VMEM loads for this phase (individual gate/up)
+                        for _b_j in range_constexpr(len(_pipe_b_sched[_p])):
+                            _b_type, _b_ku, _b_ni = _pipe_b_sched[_p][_b_j]
+                            if _b_type == 'gate':
+                                _b_gate_all[(_b_ku, _b_ni)] = load_b_packs_k64(
+                                    _bk, _b_ku,
+                                    gate_n_blk_list[_b_ni],
+                                    gate_n_intra_list[_b_ni],
+                                )
+                            else:
+                                _b_up_all[(_b_ku, _b_ni)] = load_b_packs_k64(
+                                    _bk, _b_ku,
+                                    up_n_blk_list[_b_ni],
+                                    up_n_intra_list[_b_ni],
+                                )
 
-                    # Phase 1: ds_read A[1] + B(ku=0,ni=1) + scale_gate
-                    rocdl.sched_barrier(0)
-                    _g00 = load_b_packs_k64(
-                        _bk, 0, gate_n_blk_list[0], gate_n_intra_list[0]
-                    )
-                    _u00 = load_b_packs_k64(
-                        _bk, 0, up_n_blk_list[0], up_n_intra_list[0]
-                    )
-                    # _barrier()
+                        # A ds_read pair for this phase (from pre-computed schedule)
+                        rocdl.sched_barrier(0)
+                        if _p < len(_pipe_a_groups):
+                            for _a_j in range_constexpr(len(_pipe_a_groups[_p])):
+                                _ak, _ami = _pipe_a_groups[_p][_a_j]
+                                _a_all[(_ak, _ami)] = load_a_subtile(
+                                    _ak, _ami, lds_read,
+                                )
+                        rocdl.sched_barrier(0)
 
-                    rocdl.sched_barrier(0)
-                    _a2 = load_a_subtile(1, 0, lds_read)
-                    _a3 = load_a_subtile(1, 1, lds_read)
-                    rocdl.sched_barrier(0)
+                        # MFMA on prev data
+                        _k_idx, _mi_idx, _ikxdl, _imxdl, _asv_idx = _pipe_mfma_order[_p]
+                        rocdl.s_setprio(1)
+                        compute_4mfma_phase(
+                            prev_a_tile[_k_idx * m_repeat + _mi_idx],
+                            prev_gate_w[_k_idx],
+                            prev_up_w[_k_idx],
+                            _prev_asvs[_asv_idx], _prev_gsv, _prev_usv,
+                            acc_gate, acc_up,
+                            _ikxdl, _imxdl, _mi_idx,
+                        )
+                        rocdl.s_setprio(0)
+                        rocdl.sched_barrier(0)
 
-                    rocdl.s_setprio(1)
-                    compute_4mfma_phase(
-                        prev_a_tile[1], prev_gate_w[0], prev_up_w[0],
-                        _asv, _gsv, _usv,
-                        acc_gate, acc_up, 0, 1,
-                    )
-                    rocdl.s_setprio(0)
-                    # _barrier()
-                    rocdl.sched_barrier(0)
+                    # ---- Assemble loaded data for next half-iteration ----
+                    cur_a_tile = []
+                    for _k in range_constexpr(k_unroll):
+                        for _mi in range_constexpr(m_repeat):
+                            cur_a_tile.append(_a_all[(_k, _mi)])
 
-                    # Phase 2: ds_read A[2] + B(ku=1,ni=0) + scale_up
-                    _g01 = load_b_packs_k64(
-                        _bk, 0, gate_n_blk_list[1], gate_n_intra_list[1]
-                    )
-                    _u01 = load_b_packs_k64(
-                        _bk, 0, up_n_blk_list[1], up_n_intra_list[1]
-                    )
-                    _g10 = load_b_packs_k64(
-                        _bk, 1, gate_n_blk_list[0], gate_n_intra_list[0]
-                    )
-                    # _barrier()
-                    rocdl.s_setprio(1)
-                    compute_4mfma_phase(
-                        prev_a_tile[2], prev_gate_w[1], prev_up_w[1],
-                        _asv, _gsv, _usv,
-                        acc_gate, acc_up, 1, 0,
-                    )
-                    rocdl.s_setprio(0)
-                    # _barrier()
-                    rocdl.sched_barrier(0)
+                    cur_gate_w = []
+                    cur_up_w = []
+                    for ku in range_constexpr(k_unroll):
+                        g_packs0, g_packs1 = [], []
+                        u_packs0, u_packs1 = [], []
+                        for ni in range_constexpr(num_acc_n):
+                            g = _b_gate_all[(ku, ni)]
+                            g_packs0.append(g[0])
+                            g_packs1.append(g[1])
+                            u = _b_up_all[(ku, ni)]
+                            u_packs0.append(u[0])
+                            u_packs1.append(u[1])
+                        cur_gate_w.append((g_packs0, g_packs1))
+                        cur_up_w.append((u_packs0, u_packs1))
 
-                    # Phase 3: ds_read A[3] + B(ku=1,ni=1)
-                    _u10 = load_b_packs_k64(
-                        _bk, 1, up_n_blk_list[0], up_n_intra_list[0]
-                    )
-                    _g11 = load_b_packs_k64(
-                        _bk, 1, gate_n_blk_list[1], gate_n_intra_list[1]
-                    )
-                    _u11 = load_b_packs_k64(
-                        _bk, 1, up_n_blk_list[1], up_n_intra_list[1]
-                    )
-                    # _barrier()
-                    rocdl.s_setprio(1)
-                    compute_4mfma_phase(
-                        prev_a_tile[3], prev_gate_w[1], prev_up_w[1],
-                        _asv, _gsv, _usv,
-                        acc_gate, acc_up, 1, 1,
-                    )
-                    rocdl.s_setprio(0)
-                    # _barrier()
-                    rocdl.sched_barrier(0)
-
-                    # Assemble loaded data for next half-iteration
-                    cur_a_tile = [_a0, _a1, _a2, _a3]
-                    cur_gate_w = [
-                        ([_g00[0], _g01[0]], [_g00[1], _g01[1]]),
-                        ([_g10[0], _g11[0]], [_g10[1], _g11[1]]),
-                    ]
-                    cur_up_w = [
-                        ([_u00[0], _u01[0]], [_u00[1], _u01[1]]),
-                        ([_u10[0], _u11[0]], [_u10[1], _u11[1]]),
-                    ]
-                    cur_a_scale = [
-                        vector.from_elements(T.vec(1, T.i32), [_as_v])
-                    ]
+                    cur_a_scale = []
+                    for _mi_p in range_constexpr(m_repeat_packed):
+                        cur_a_scale.append(vector.from_elements(
+                            T.vec(1, T.i32), [_new_as_list[_mi_p]],
+                        ))
                     cur_gate_bs = [
-                        vector.from_elements(T.vec(1, T.i32), [_gs_v])
+                        vector.from_elements(T.vec(1, T.i32), [_new_gs])
                     ]
                     cur_up_bs = [
-                        vector.from_elements(T.vec(1, T.i32), [_us_v])
+                        vector.from_elements(T.vec(1, T.i32), [_new_us])
                     ]
 
                     if not use_async_copy:
