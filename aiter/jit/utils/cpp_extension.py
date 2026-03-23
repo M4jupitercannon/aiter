@@ -16,6 +16,15 @@ import subprocess
 import sys
 import sysconfig
 import warnings
+from typing import Dict, List, Optional, Tuple, Union
+
+import setuptools
+from _cpp_extension_versioner import ExtensionVersioner
+from file_baton import FileBaton
+from hipify import hipify_python
+from hipify.hipify_python import GeneratedFileCleaner
+from packaging.version import Version
+from setuptools.command.build_ext import build_ext
 
 
 def _quote(s: str) -> str:
@@ -33,15 +42,7 @@ def _quote(s: str) -> str:
             return '"' + s.replace('"', '\\"') + '"'
         return s
     return shlex.quote(s)
-from typing import Dict, List, Optional, Tuple, Union
 
-import setuptools
-from _cpp_extension_versioner import ExtensionVersioner
-from file_baton import FileBaton
-from hipify import hipify_python
-from hipify.hipify_python import GeneratedFileCleaner
-from packaging.version import Version
-from setuptools.command.build_ext import build_ext
 
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
@@ -50,7 +51,9 @@ if IS_WINDOWS:
     EXEC_EXT = ".exe"
     CLIB_PREFIX = ""
     CLIB_EXT = ".dll"
-    SHARED_FLAG = ""   # MSVC/clang-cl uses /DLL via the linker; hipcc on Windows uses --shared
+    SHARED_FLAG = (
+        ""  # MSVC/clang-cl uses /DLL via the linker; hipcc on Windows uses --shared
+    )
 else:
     LIB_EXT = ".so"
     EXEC_EXT = ""
@@ -144,7 +147,8 @@ def _find_rocm_home() -> Optional[str]:
         site_candidates = []
         try:
             import site as _site
-            site_candidates += (_site.getsitepackages() or [])
+
+            site_candidates += _site.getsitepackages() or []
             user_site = _site.getusersitepackages()
             if user_site:
                 site_candidates.append(user_site)
@@ -152,6 +156,7 @@ def _find_rocm_home() -> Optional[str]:
             pass
         try:
             import sysconfig as _sc
+
             p = _sc.get_path("purelib")
             if p:
                 site_candidates.append(p)
@@ -163,6 +168,7 @@ def _find_rocm_home() -> Optional[str]:
         # Also try finding via an installed package we know exists
         try:
             import torch as _torch
+
             torch_site = os.path.dirname(os.path.dirname(_torch.__file__))
             site_candidates.append(torch_site)
         except Exception:
@@ -196,6 +202,7 @@ def _find_rocm_home() -> Optional[str]:
     if rocm_home is None and sys.platform == "win32":
         # Guess #3 — standard Windows SDK install locations
         import glob as _glob
+
         for pattern in [
             r"C:\Program Files\AMD\ROCm\*",
             r"C:\Program Files (x86)\AMD\ROCm\*",
@@ -276,6 +283,7 @@ ROCM_HOME = _find_rocm_home()
 if sys.platform == "win32" and ROCM_HOME and not os.path.splitdrive(ROCM_HOME)[0]:
     try:
         import torch as _torch_anchor
+
         _sp = os.path.abspath(os.path.dirname(os.path.dirname(_torch_anchor.__file__)))
         for _sdk in ("_rocm_sdk_devel", "_rocm_sdk_core"):
             _cand = os.path.join(_sp, _sdk)
@@ -386,6 +394,7 @@ def get_cxx_compiler():
         # since the ROCm SDK is bundled there on Windows PyTorch ROCm wheels.
         try:
             import torch as _torch
+
             sp = os.path.dirname(os.path.dirname(_torch.__file__))
             for sdk in ("_rocm_sdk_devel", "_rocm_sdk_core"):
                 candidate = os.path.join(sp, sdk, "bin", "hipcc.exe")
@@ -640,7 +649,6 @@ class BuildExtension(build_ext):
         if self.compiler.compiler_type == "msvc":
             self.compiler._cpp_extensions += [".cu", ".cuh"]
             original_compile = self.compiler.compile
-            original_spawn = self.compiler.spawn
         else:
             original_compile = self.compiler._compile
 
@@ -1544,8 +1552,10 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
         py_lib_name = f"python{sys.version_info.major}{sys.version_info.minor}.lib"
         py_lib_dir = None
         py_lib_candidates = []
-        for prefix in (getattr(sys, "base_prefix", None),
-                       getattr(sys, "base_exec_prefix", None)):
+        for prefix in (
+            getattr(sys, "base_prefix", None),
+            getattr(sys, "base_exec_prefix", None),
+        ):
             if prefix:
                 py_lib_candidates += [prefix, os.path.join(prefix, "libs")]
         try:
@@ -1557,17 +1567,21 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
                         if line.lower().startswith("home"):
                             base_home = line.split("=", 1)[1].strip()
                             base_root = os.path.dirname(base_home)
-                            py_lib_candidates += [base_home,
-                                                  os.path.join(base_root, "libs"),
-                                                  base_root]
+                            py_lib_candidates += [
+                                base_home,
+                                os.path.join(base_root, "libs"),
+                                base_root,
+                            ]
                             break
         except Exception:
             pass
         exe_dir = os.path.dirname(sys.executable)
-        py_lib_candidates += [exe_dir,
-                               os.path.join(exe_dir, "libs"),
-                               os.path.dirname(exe_dir),
-                               os.path.join(os.path.dirname(exe_dir), "libs")]
+        py_lib_candidates += [
+            exe_dir,
+            os.path.join(exe_dir, "libs"),
+            os.path.dirname(exe_dir),
+            os.path.join(os.path.dirname(exe_dir), "libs"),
+        ]
         for cand in py_lib_candidates:
             if cand and os.path.isfile(os.path.join(cand, py_lib_name)):
                 py_lib_dir = cand
@@ -1590,10 +1604,14 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
             extra_ldflags.append(f"-L{_ninja_var_path(TORCH_LIB_PATH)}")
             extra_ldflags.append("c10.lib")
             if with_cuda:
-                extra_ldflags.append("c10_hip.lib" if IS_HIP_EXTENSION else "c10_cuda.lib")
+                extra_ldflags.append(
+                    "c10_hip.lib" if IS_HIP_EXTENSION else "c10_cuda.lib"
+                )
             extra_ldflags.append("torch_cpu.lib")
             if with_cuda:
-                extra_ldflags.append("torch_hip.lib" if IS_HIP_EXTENSION else "torch_cuda.lib")
+                extra_ldflags.append(
+                    "torch_hip.lib" if IS_HIP_EXTENSION else "torch_cuda.lib"
+                )
             extra_ldflags.append("torch.lib")
             if not is_standalone:
                 extra_ldflags.append("torch_python.lib")
@@ -1604,7 +1622,9 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
                 extra_ldflags.append("-lc10_hip" if IS_HIP_EXTENSION else "-lc10_cuda")
             extra_ldflags.append("-ltorch_cpu")
             if with_cuda:
-                extra_ldflags.append("-ltorch_hip" if IS_HIP_EXTENSION else "-ltorch_cuda")
+                extra_ldflags.append(
+                    "-ltorch_hip" if IS_HIP_EXTENSION else "-ltorch_cuda"
+                )
             extra_ldflags.append("-ltorch")
             if not is_standalone:
                 extra_ldflags.append("-ltorch_python")
@@ -1647,6 +1667,7 @@ def _get_rocm_arch_flags(cflags: Optional[List[str]] = None) -> List[str]:
     if sys.platform == "win32" and archs:
         try:
             from chip_info import get_gfx
+
             detected = get_gfx()
             if detected and detected != "unknown" and detected in archs:
                 archs = [detected]
@@ -1833,8 +1854,10 @@ def _write_ninja_file_to_build_library(
         return target
 
     objects = [object_file_path(src) for src in sources]
-    ldflags = extra_ldflags if is_standalone else (
-        ([SHARED_FLAG] if SHARED_FLAG else []) + extra_ldflags
+    ldflags = (
+        extra_ldflags
+        if is_standalone
+        else (([SHARED_FLAG] if SHARED_FLAG else []) + extra_ldflags)
     )
 
     ext = EXEC_EXT if is_standalone else LIB_EXT

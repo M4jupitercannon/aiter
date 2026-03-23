@@ -188,13 +188,17 @@ def get_cu_num_custom_op() -> int:
                 if cu is not None:
                     gpu_compute_units.append(cu)
         except Exception as e:
-            raise RuntimeError(f"Get GPU Compute Unit from rocminfo/hipinfo failed: {e}")
+            raise RuntimeError(
+                f"Get GPU Compute Unit from rocminfo/hipinfo failed: {e}"
+            )
 
         if not gpu_compute_units:
-            raise RuntimeError("Could not determine Compute Unit count from GPU info output.")
-        assert len(set(gpu_compute_units)) == 1, (
-            f"Multiple different CU counts found: {gpu_compute_units}"
-        )
+            raise RuntimeError(
+                "Could not determine Compute Unit count from GPU info output."
+            )
+        assert (
+            len(set(gpu_compute_units)) == 1
+        ), f"Multiple different CU counts found: {gpu_compute_units}"
         cu_num = gpu_compute_units[0]
     return cu_num
 

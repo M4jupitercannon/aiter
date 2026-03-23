@@ -421,9 +421,7 @@ def hip_flag_checker(flag_hip: str) -> bool:
         tmp_in = None
         tmp_out = None
         try:
-            with tempfile.NamedTemporaryFile(
-                suffix=".cu", delete=False, mode="w"
-            ) as f:
+            with tempfile.NamedTemporaryFile(suffix=".cu", delete=False, mode="w") as f:
                 f.write("// flag check\n")
                 tmp_in = f.name
             tmp_out = tmp_in.replace(".cu", ".o")
@@ -471,7 +469,7 @@ def check_LLVM_MAIN_REVISION():
     import tempfile
     from cpp_extension import get_cxx_compiler
 
-    src = '#include <tuple>\n__host__ __device__ void func(){std::tuple<int, int> t = std::tuple(1, 1);}\n'
+    src = "#include <tuple>\n__host__ __device__ void func(){std::tuple<int, int> t = std::tuple(1, 1);}\n"
     hipcc_bin = get_cxx_compiler()
     if sys.platform == "win32":
         # On Windows we can't use bash pipes; write to a temp file instead.
@@ -480,7 +478,15 @@ def check_LLVM_MAIN_REVISION():
             tmp = f.name
         try:
             subprocess.check_output(
-                [hipcc_bin, "-x", "hip", "-P", "-c", "-Wno-unused-command-line-argument", tmp],
+                [
+                    hipcc_bin,
+                    "-x",
+                    "hip",
+                    "-P",
+                    "-c",
+                    "-Wno-unused-command-line-argument",
+                    tmp,
+                ],
                 stderr=subprocess.STDOUT,
                 text=True,
             )
@@ -501,7 +507,9 @@ def check_LLVM_MAIN_REVISION():
         cmd = """echo "#include <tuple>
 __host__ __device__ void func(){std::tuple<int, int> t = std::tuple(1, 1);}" | hipcc -x hip -P -c -Wno-unused-command-line-argument -o /dev/null -"""
         try:
-            subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT)
+            subprocess.check_output(
+                cmd, shell=True, text=True, stderr=subprocess.STDOUT
+            )
         except subprocess.CalledProcessError:
             return 554785
         return 554785 - 1
@@ -733,6 +741,7 @@ def clone_3rdparty(third_party: str) -> None:
 
 def rm_module(md_name):
     import glob as _glob
+
     _lib_ext = ".pyd" if sys.platform == "win32" else ".so"
     for _f in _glob.glob(f"{get_user_jit_dir()}/{md_name}{_lib_ext}"):
         try:
@@ -743,6 +752,7 @@ def rm_module(md_name):
 
 def clear_build(md_name):
     import shutil as _shutil
+
     _shutil.rmtree(f"{bd_dir}/{md_name}", ignore_errors=True)
 
 
