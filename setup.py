@@ -329,14 +329,20 @@ setup(
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
     install_requires=[
-        "pybind11>=3.0.1",
-        "ninja",
-        "pandas",
         "einops",
-        "psutil",
         "packaging",
-        "flydsl==0.1.1",
-    ],
+        "psutil",
+    ]
+    + (
+        [
+            "pybind11>=3.0.1",
+            "ninja",
+            "pandas",
+            "flydsl==0.1.1",
+        ]
+        if not IS_WINDOWS
+        else []
+    ),
     extras_require={
         # Triton-based communication using Iris
         # Note: Iris is not available on PyPI and must be installed separately
