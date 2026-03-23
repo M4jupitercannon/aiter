@@ -9,6 +9,7 @@ on:
       - 'csrc/py_itfs_ck/mha_*'
       - 'csrc/py_itfs_ck/attention_kernels.cu'
       - 'setup.py'
+      - 'aiter/__init__.py'
       - '.github/workflows/flash_attention_integration.yaml'
   pull_request:
     branches: [main]
@@ -18,6 +19,7 @@ on:
       - 'csrc/py_itfs_ck/mha_*'
       - 'csrc/py_itfs_ck/attention_kernels.cu'
       - 'setup.py'
+      - 'aiter/__init__.py'
       - '.github/workflows/flash_attention_integration.yaml'
   workflow_dispatch:
 
@@ -62,6 +64,7 @@ jobs:
           filters: |
             shared:
               - 'setup.py'
+              - 'aiter/__init__.py'
               - '.github/workflows/flash_attention_integration.yaml'
             triton:
               - 'aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/**'
@@ -209,6 +212,53 @@ jobs:
           docker stop fa_triton_test || true
           docker rm -f fa_triton_test || true
           docker rmi fa_triton_test:ci || true
+
+  # =============================================================================
+  # Windows Smoke Test (import-only, no GPU)
+  # =============================================================================
+  windows_smoke:
+    if: ${{ needs.prechecks.outputs.run_triton == 'true' }}
+    name: Windows Smoke Test (import-only)
+    needs: [prechecks]
+    runs-on: windows-latest
+    steps:
+      - name: Checkout aiter repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+        shell: bash
+
+      - name: Install aiter
+        run: pip install -e . --no-build-isolation
+        shell: bash
+
+      - name: Install flash-attention (Triton backend)
+        run: |
+          git clone -b ${{ env.FA_BRANCH }} ${{ env.FA_REPOSITORY_URL }} flash-attention
+          rm -rf flash-attention/${{ env.AITER_SUBMODULE_PATH }}
+          cp -a . flash-attention/${{ env.AITER_SUBMODULE_PATH }}
+          cd flash-attention
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE pip install --no-build-isolation -e .
+        shell: bash
+
+      - name: Verify FA imports aiter Triton backend
+        run: |
+          cd flash-attention
+          python -c "
+          from flash_attn.flash_attn_interface import flash_attn_func
+          print('flash_attn_func loaded successfully:', flash_attn_func)
+          "
+        shell: bash
 
   # =============================================================================
   # CK Backend
