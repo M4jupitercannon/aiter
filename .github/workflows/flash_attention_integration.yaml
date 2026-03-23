@@ -254,10 +254,7 @@ jobs:
       - name: Verify FA imports aiter Triton backend
         run: |
           cd flash-attention
-          python -c "
-          from flash_attn.flash_attn_interface import flash_attn_func
-          print('flash_attn_func loaded successfully:', flash_attn_func)
-          "
+          python -c "from flash_attn.flash_attn_interface import flash_attn_func; print('flash_attn_func loaded:', flash_attn_func)"
         shell: bash
 
   # =============================================================================

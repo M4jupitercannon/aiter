@@ -65,9 +65,11 @@ def prepare_packaging():
         shutil.rmtree("aiter_meta")
     if ENABLE_CK:
         shutil.copytree("3rdparty", "aiter_meta/3rdparty")
-        shutil.copytree("hsa", "aiter_meta/hsa")
     else:
         os.makedirs("aiter_meta/3rdparty", exist_ok=True)
+    if not IS_WINDOWS:
+        shutil.copytree("hsa", "aiter_meta/hsa")
+    else:
         os.makedirs("aiter_meta/hsa", exist_ok=True)
     shutil.copytree("gradlib", "aiter_meta/gradlib")
     shutil.copytree("csrc", "aiter_meta/csrc")
